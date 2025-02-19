@@ -30,7 +30,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/10cks/ShellcodeInjecterGo.git
+git clone https://github.com/Gr-1m/ShellcodeInjecterGo.git
 
 # 进入项目目录
 cd ShellcodeInjecterGo
@@ -156,5 +156,6 @@ ShellcodeInjecterGo.exe -f shellcode.bin -e "C:\Windows\notepad.exe"
 ## 致谢
 
 - [ChrisPritchard/golang-shellcode-runner](https://github.com/ChrisPritchard/golang-shellcode-runner)
+- [sharcmz/ShellcodeInjecterGo](https://github.com/sharcmz/ShellcodeInjecterGo)
 - Windows系统编程文档
 - Go语言社区
